@@ -1,0 +1,147 @@
+version: '3'
+
+networks:
+  proxy:
+    external: true
+  internal:
+    external: false
+
+volumes:
+  db:
+  nc:
+  nc-apps:
+  nc-data:
+  nc-config:
+
+services:
+  traefik:
+    image: traefik:v2.1
+    restart: unless-stopped
+    command:
+      - --log.level=DEBUG
+      - --entrypoints.http.address=:80
+      - --entrypoints.https.address=:443
+      - --providers.docker
+      - --api
+      - --certificatesresolvers.leresolver.acme.email=EMAILADDR
+      - --certificatesresolvers.leresolver.acme.storage=/letsencrypt/acme.json
+      - --certificatesresolvers.leresolver.acme.tlschallenge=true
+      - --providers.file.filename=/ssl/traefik.yaml
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - proxy
+    ports:
+      - 80:80
+      - 443:443
+    volumes:
+      - /etc/localtime:/etc/localtime:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./letsencrypt:/letsencrypt
+      - ./traefik.yaml:/ssl/traefik.yaml
+    labels:
+      # Dashboard
+      - "traefik.http.routers.traefik-secure.rule=Host(`traefik.DOMAINNAME`)"
+      - "traefik.http.routers.traefik-secure.entrypoints=https"
+      - "traefik.http.routers.traefik-secure.tls.certresolver=leresolver"
+      - "traefik.http.routers.traefik-secure.service=api@internal"
+      - "traefik.http.routers.traefik-secure.middlewares=known-ips,authtraefik"
+      - "traefik.http.middlewares.authtraefik.basicauth.users=TRAEFIK_HTPASS"
+      # global redirect to https
+      - "traefik.http.routers.http-catchall.rule=hostregexp(`{host:.+}`)"
+      - "traefik.http.routers.http-catchall.entrypoints=http"
+      - "traefik.http.routers.http-catchall.middlewares=redirect-to-https"
+      - "traefik.http.middlewares.redirect-to-https.redirectscheme.scheme=https"
+      # white list internal IPs
+      - "traefik.http.middlewares.known-ips.ipwhitelist.sourceRange=10.0.0.0/24,192.168.0.0/16,172.0.0.0/8,127.0.0.1/32"
+
+  mariadb:
+    image: mariadb:latest
+    command: --transaction-isolation=READ-COMMITTED --binlog-format=ROW --character-set-server=utf8mb4 --collation-server=utf8mb4_general_ci
+    restart: always
+    networks:
+      - internal
+    volumes:
+      - db:/var/lib/mysql
+    env_file:
+      - docker.env
+
+  adminer:
+    image: adminer:4.7-standalone
+    restart: unless-stopped
+    networks:
+      - internal
+      - proxy
+    labels:
+      - "traefik.http.routers.adminer-secure.entrypoints=https"
+      - "traefik.http.routers.adminer-secure.rule=Host(`adminer.DOMAINNAME`)"
+      - "traefik.http.routers.adminer-secure.tls=true"
+      - "traefik.http.routers.adminer-secure.tls.certresolver=leresolver"
+      - "traefik.http.routers.adminer-secure.service=adminer"
+      - "traefik.http.routers.adminer-secure.middlewares=known-ips"
+      - "traefik.http.services.adminer.loadbalancer.server.port=8080"
+      - "traefik.docker.network=proxy"
+    depends_on:
+      - mariadb
+
+  redis:
+    image: redis:alpine
+    networks:
+      - internal
+    restart: always
+
+  nextcloud:
+    image: nextcloud:latest
+    hostname: DOMAINNAME
+    env_file:
+      - docker.env
+    restart: always
+    volumes:
+      - nc:/var/www/html
+      - nc-apps:/var/www/html/custom_apps
+      - nc-data:/var/www/html/data
+      - nc-config:/var/www/html/config
+    labels:
+      - "traefik.docker.network=proxy"
+      - "traefik.http.routers.nextcloud.entrypoints=https"
+      - "traefik.http.routers.nextcloud.tls=true"
+      - "traefik.http.routers.nextcloud.tls.certresolver=leresolver"
+      - "traefik.http.routers.nextcloud.rule=Host(`DOMAINNAME`)"
+      - "traefik.http.routers.nextcloud.middlewares=nc-rep,nc-header"
+      - "traefik.http.middlewares.nc-rep.redirectregex.regex=https://(.*)/.well-known/(card|cal)dav"
+      - "traefik.http.middlewares.nc-rep.redirectregex.replacement=https://$$1/remote.php/dav/"
+      - "traefik.http.middlewares.nc-rep.redirectregex.permanent=true"
+      - "traefik.http.middlewares.nc-header.headers.frameDeny=true"
+      - "traefik.http.middlewares.nc-header.headers.sslRedirect=true"
+      - "traefik.http.middlewares.nc-header.headers.contentTypeNosniff=true"
+      - "traefik.http.middlewares.nc-header.headers.stsIncludeSubdomains=true"
+      - "traefik.http.middlewares.nc-header.headers.stsPreload=true"
+      - "traefik.http.middlewares.nc-header.headers.stsSeconds=31536000"
+      - "traefik.http.middlewares.nc-header.headers.referrerPolicy=no-referrer"
+      - "traefik.http.middlewares.nc-header.headers.browserXssFilter=true"
+      - "traefik.http.middlewares.nc-header.headers.customRequestHeaders.X-Forwarded-Proto=https"
+      - "traefik.http.middlewares.nc-header.headers.customResponseHeaders.X-Robots-Tag=none"
+      - "traefik.http.middlewares.nc-header.headers.customFrameOptionsValue=SAMEORIGIN"
+    networks:
+      - internal
+      - proxy
+    depends_on:
+      - mariadb
+      - redis
+
+  nextcloud-cron:
+    image: nextcloud:latest
+    env_file:
+      - docker.env
+    restart: unless-stopped
+    volumes:
+      - nc:/var/www/html
+      - nc-apps:/var/www/html/custom_apps
+      - nc-data:/var/www/html/data
+      - nc-config:/var/www/html/config
+    command: [ "/cron.sh" ]
+    networks:
+      - internal
+    depends_on:
+      - nextcloud
+      - mariadb
