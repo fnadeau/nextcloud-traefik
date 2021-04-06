@@ -117,7 +117,7 @@ services:
       - "traefik.http.middlewares.nc-header.headers.stsIncludeSubdomains=true"
       - "traefik.http.middlewares.nc-header.headers.stsPreload=true"
       - "traefik.http.middlewares.nc-header.headers.stsSeconds=31536000"
-      - "traefik.http.middlewares.nc-header.headers.referrerPolicy=no-referrer"
+      - "traefik.http.middlewares.nc-header.headers.referrerPolicy=same-origin"
       - "traefik.http.middlewares.nc-header.headers.browserXssFilter=true"
       - "traefik.http.middlewares.nc-header.headers.customRequestHeaders.X-Forwarded-Proto=https"
       - "traefik.http.middlewares.nc-header.headers.customResponseHeaders.X-Robots-Tag=none"
