@@ -5,17 +5,22 @@ networks:
     external: true
   internal:
     external: false
+  monitoring:
+    external: false
 
 volumes:
+  traefik-letsencrypt:
   db:
   nc:
   nc-apps:
   nc-data:
   nc-config:
+  grafana:
+  prometheus-data:
 
 services:
   traefik:
-    image: traefik:v2.4
+    image: traefik:v2.4.8
     restart: unless-stopped
     command:
       - --log.level=DEBUG
@@ -23,10 +28,14 @@ services:
       - --entrypoints.https.address=:443
       - --providers.docker
       - --api
-      - --certificatesresolvers.leresolver.acme.email=EMAILADDR
+      - --certificatesresolvers.leresolver.acme.email=${EMAILADDR}
       - --certificatesresolvers.leresolver.acme.storage=/letsencrypt/acme.json
       - --certificatesresolvers.leresolver.acme.tlschallenge=true
+      # If running test environment, uncomment line below. Letsencrypt has a rate limit of 5 certificats per month.
+      #- --certificatesresolvers.leresolver.acme.caserver=https://acme-staging-v02.api.letsencrypt.org/directory
       - --providers.file.filename=/ssl/traefik.yaml
+      - --metrics=true
+      - --metrics.prometheus=true
     security_opt:
       - no-new-privileges:true
     networks:
@@ -37,16 +46,16 @@ services:
     volumes:
       - /etc/localtime:/etc/localtime:ro
       - /var/run/docker.sock:/var/run/docker.sock:ro
-      - ./letsencrypt:/letsencrypt
-      - ./traefik.yaml:/ssl/traefik.yaml
+      - traefik-letsencrypt:/letsencrypt
+      - ./traefik/traefik.yaml:/ssl/traefik.yaml
     labels:
       # Dashboard
-      - "traefik.http.routers.traefik-secure.rule=Host(`traefik.DOMAINNAME`)"
+      - "traefik.http.routers.traefik-secure.rule=Host(`traefik.${DOMAINNAME}`)"
       - "traefik.http.routers.traefik-secure.entrypoints=https"
       - "traefik.http.routers.traefik-secure.tls.certresolver=leresolver"
       - "traefik.http.routers.traefik-secure.service=api@internal"
       - "traefik.http.routers.traefik-secure.middlewares=known-ips,authtraefik"
-      - "traefik.http.middlewares.authtraefik.basicauth.users=TRAEFIK_HTPASS"
+      - "traefik.http.middlewares.authtraefik.basicauth.users=${TRAEFIK_HTPASS}"
       # global redirect to https
       - "traefik.http.routers.http-catchall.rule=hostregexp(`{host:.+}`)"
       - "traefik.http.routers.http-catchall.entrypoints=http"
@@ -64,7 +73,7 @@ services:
     volumes:
       - db:/var/lib/mysql
     env_file:
-      - docker.env
+      - docker.${ENVIRONMENT}.env
 
   adminer:
     image: adminer:4.7-standalone
@@ -74,7 +83,7 @@ services:
       - proxy
     labels:
       - "traefik.http.routers.adminer-secure.entrypoints=https"
-      - "traefik.http.routers.adminer-secure.rule=Host(`adminer.DOMAINNAME`)"
+      - "traefik.http.routers.adminer-secure.rule=Host(`adminer.${DOMAINNAME}`)"
       - "traefik.http.routers.adminer-secure.tls=true"
       - "traefik.http.routers.adminer-secure.tls.certresolver=leresolver"
       - "traefik.http.routers.adminer-secure.service=adminer"
@@ -89,12 +98,13 @@ services:
     networks:
       - internal
     restart: always
+    command: redis-server --requirepass ${REDIS_PASS}
 
   nextcloud:
-    image: nextcloud:latest
-    hostname: DOMAINNAME
+    image: nextcloud:20.0
+    hostname: ${DOMAINNAME}
     env_file:
-      - docker.env
+      - docker.${ENVIRONMENT}.env
     restart: always
     volumes:
       - nc:/var/www/html
@@ -106,7 +116,7 @@ services:
       - "traefik.http.routers.nextcloud.entrypoints=https"
       - "traefik.http.routers.nextcloud.tls=true"
       - "traefik.http.routers.nextcloud.tls.certresolver=leresolver"
-      - "traefik.http.routers.nextcloud.rule=Host(`DOMAINNAME`)"
+      - "traefik.http.routers.nextcloud.rule=Host(`${DOMAINNAME}`)"
       - "traefik.http.routers.nextcloud.middlewares=nc-rep,nc-header"
       - "traefik.http.middlewares.nc-rep.redirectregex.regex=https://(.*)/.well-known/(card|cal)dav"
       - "traefik.http.middlewares.nc-rep.redirectregex.replacement=https://$$1/remote.php/dav/"
@@ -130,9 +140,9 @@ services:
       - redis
 
   nextcloud-cron:
-    image: nextcloud:latest
+    image: nextcloud:20.0
     env_file:
-      - docker.env
+      - docker.${ENVIRONMENT}.env
     restart: unless-stopped
     volumes:
       - nc:/var/www/html
@@ -144,4 +154,85 @@ services:
       - internal
     depends_on:
       - nextcloud
-      - mariadb
+
+  grafana:
+    image: grafana/grafana:7.5.2
+    labels:
+      - "traefik.docker.network=proxy"
+      - "traefik.http.routers.grafana.entrypoints=https"
+      - "traefik.http.routers.grafana.rule=Host(`grafana.${DOMAINNAME}`)"
+      - "traefik.http.routers.grafana.tls=true"
+      - "traefik.http.routers.grafana.tls.certresolver=leresolver"
+      - "traefik.http.routers.grafana.service=grafana"
+      - "traefik.http.routers.grafana.middlewares=known-ips"
+      - "traefik.http.services.grafana.loadbalancer.server.port=3000"
+    networks:
+      - proxy
+      - monitoring
+    volumes:
+      - grafana:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning
+    restart: on-failure
+
+  node_exporter:
+    image: prom/node-exporter:v1.1.2
+    labels:
+      - "traefik.enable=false"
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/rootfs:ro
+    command:
+      - '--path.procfs=/host/proc'
+      - '--path.rootfs=/rootfs'
+      - '--path.sysfs=/host/sys'
+      - '--collector.filesystem.ignored-mount-points=^/(sys|proc|dev|host|etc)($$|/)'
+    networks:
+      - monitoring
+    restart: unless-stopped
+
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:v0.39.0
+    labels:
+      - "traefik.enable=false"
+    networks:
+      - monitoring
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:rw
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+    restart: on-failure
+
+  prometheus:
+    image: prom/prometheus:v2.26.0
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--web.enable-lifecycle"
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.prometheus.entrypoints=https"
+      - "traefik.http.routers.prometheus.rule=Host(`prometheus.${DOMAINNAME}`)"
+      - "traefik.http.routers.prometheus.service=prometheus"
+      - "traefik.http.routers.prometheus.tls=true"
+      - "traefik.http.routers.prometheus.tls.certresolver=leresolver"
+      - "traefik.http.services.prometheus.loadbalancer.server.port=9090"
+    networks:
+      - proxy
+      - monitoring
+    volumes:
+      - ./prometheus:/etc/prometheus
+      - prometheus-data:/prometheus
+    restart: on-failure
+
+  nextcloud_exporter:
+    image: xperimental/nextcloud-exporter:v0.4.0
+    labels:
+      - "traefik.enable=false"
+    networks:
+      - monitoring
+      - proxy
+    env_file:
+      - nextcloud_exporter.${ENVIRONMENT}.env
+    depends_on:
+      - nextcloud

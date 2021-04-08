@@ -1,4 +1,3 @@
-docker.env
-docker-compose.yml
+*.env
 letsencrypt
 config.php
